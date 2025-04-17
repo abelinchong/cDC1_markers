@@ -1,0 +1,160 @@
+## loading packages
+library("dplyr")
+library("data.table")
+library("edgeR")
+library("org.Mm.eg.db")
+library("ggplot2")
+library("fgsea")
+library("GO.db")
+library("gage")
+#library("gageData")
+library("ggpubr")
+library("ComplexHeatmap")
+
+## paths
+projectPath <- here::here()
+dataPath <- here::here("data")
+metadataPath <- here::here("metadata")
+sourceCode <- here::here("src")
+plotsPath <- here::here("plots")
+reportsPath <- here::here("reports")
+source(file.path(sourceCode, "helperFunctions.R"))
+
+```
+
+
+# 1. Analysis with GSE109125 alone
+To identify those i) highly expressed genes ii) on the surface iii) that are highly specific for cDC1s. 
+
+```{r}
+## GSE109125
+rawCountsGSE109125 <- data.table::fread(
+  file.path(dataPath, "GSE109125_Gene_count_table_GENCODE_vM25.csv.gz")
+) %>% as.data.frame()
+geneSymbol <- rawCountsGSE109125[[1]]
+rownames(rawCountsGSE109125) <- toupper(geneSymbol)
+samplesMetadataGSE109125 <- data.table::fread(
+  file = file.path(metadataPath, "GSE109125_SraRunTable.txt")
+)
+colnames(samplesMetadataGSE109125) <- tolower(
+  gsub(pattern = " ", replacement = "_", x = colnames(samplesMetadataGSE109125))
+)
+```
+
+```{r}
+#build samples metadata
+vec <- readLines(file.path(metadataPath, "series_samples_mod.txt"))
+dfIDs <- data.frame(
+  ID = strsplit(x = vec[1], split = ",")[[1]],
+  Name = strsplit(x = vec[2], split = ", ")[[1]] %>% 
+    gsub(pattern = "_RNA-seq ", replacement = "", x = .) %>% 
+    gsub(pattern = " ", replacement = "", x = .)
+)
+dfIDs <- dfIDs[-1, ]
+namesGSE109125 <- dfIDs[dfIDs$Name %in% colnames(rawCountsGSE109125), ]
+
+
+samplesMetadata <- samplesMetadataGSE109125[samplesMetadataGSE109125$`geo_accession_(exp)` %in% 
+                             namesGSE109125$ID, ]
+
+samplesMetadata <- merge(
+  samplesMetadata, dfIDs, by.x = "geo_accession_(exp)", by.y = "ID"
+)
+samplesMetadata$Groups <- gsub(
+  pattern = "#\\d|\\.\\d$", replacement = "", x = samplesMetadata$Name, perl = TRUE
+)
+samplesMetadata$TissueDef <- ifelse(
+  test = is.na(samplesMetadata$tissue), 
+  yes = samplesMetadata$source_name, 
+  no = samplesMetadata$tissue
+)
+
+
+# build final count matrix 
+rawCounts <- rawCountsGSE109125[, samplesMetadata$Name]
+
+
+## build genes metadata
+gtfMouse <- rtracklayer::readGFF(
+  file.path(metadataPath, "gencode.vM25.annotation.gtf.gz")
+)
+gtfMouse$gene_name <- toupper(gtfMouse$gene_name)
+entrez <- read.table(file.path(metadataPath, "gencode.vM25.metadata.EntrezGene"))
+
+colnames(entrez) <- c("transcript_id", "entrez_id")
+gtfMouse <- merge(
+  x = gtfMouse, y = entrez, by.x = "transcript_id", by.y = "transcript_id"
+)
+
+gtfMouse <- gtfMouse[gtfMouse$gene_name %in% rownames(rawCounts), ]
+gtfMouse <- gtfMouse[!duplicated(gtfMouse$gene_name), ]
+rownames(gtfMouse) <- gtfMouse$gene_name
+
+## remove unmatched genes
+rawCounts <- rawCounts[gtfMouse$gene_name, ]
+genesMetadata <- gtfMouse[rownames(rawCounts), ]
+
+## Formatting names and setting colors
+samplesMetadata$TissueDef[samplesMetadata$TissueDef == "Inguinal fat"] <- "Inguinal Fat"
+```
+
+
+```{r}
+## normalization 
+rawCountsF <- rawCounts[rowSums(rawCounts) > 1, ]
+
+dfLibSize <- data.frame(
+  libSize = round(colSums(rawCountsF) * 1e-6, 3),
+  Samples = colnames(rawCountsF),
+  Tissue = samplesMetadata$TissueDef,
+  Groups = samplesMetadata$Groups
+)
+
+cat("=== Original number of genes:\n")
+print(nrow(rawCounts))
+cat("=== Number of genes after filtering:\n")
+print(nrow(rawCountsF))
+cat("=== Expression levels by sample before filtering:\n")
+print(summary(rowSums(rawCounts)))
+cat("=== Expression levels by sample after filtering:\n")
+print(summary(rowSums(rawCountsF)))
+
+keep.exprs <- filterByExpr(rawCountsF, group = samplesMetadata$Groups)
+rawCountsF2 <- rawCountsF[keep.exprs, ]
+DGEDataF <- DGEList(counts = rawCountsF2, group = samplesMetadata$Groups)
+DGEDataF <- calcNormFactors(DGEDataF, method = "TMM")
+lcpmTMM <- cpm(DGEDataF, log = TRUE)
+cpmTMM <- cpm(DGEDataF, log = FALSE)
+
+genesMetadataF <- genesMetadata[rownames(lcpmTMM), ]
+
+#Make the DGE with non-filtered counts for comparison
+DGEDataNF <- DGEList(counts = rawCountsF, group = samplesMetadata$Groups)
+DGEDataNF <- calcNormFactors(DGEDataNF, method = "TMM")
+lcpmTMM_NF <- cpm(DGEDataNF, log = TRUE)
+genesMetadataNF <- genesMetadata[rownames(lcpmTMM_NF), ]
+
+# Plot the library count densities
+n <- ncol(lcpmTMM_NF)  # Number of samples
+myColors <- rainbow(n)  # Assign unique colors
+par(mfrow = c(1, 2), mar = c(4.1, 4.1, 1.4, 1.8), mgp = c(2.1, 1, 0))
+plotDensities(
+  lcpmTMM_NF, title = "A. log-CPMs before filtering", ylim = 0.55,
+  xlab = "log-CPM", cols = myColors
+)
+plotDensities(
+  lcpmTMM, title = "B. log-CPMs after filtering",ylim = 0.55,
+  xlab = "log-CPM", cols = myColors
+)
+
+
+plotDensities(lcpmTMM, main = "Density plot of log-CPM after TMM normalization")
+
+
+ggplot(lcpmTMM, x=colnames(lcpmTMM), y=rownames(lcpmTMM)) +
+  geom_density(alpha = 0.3) +  # Lower alpha value for transparency
+  theme_minimal() + 
+  labs(title = "Density plot of gene expression by sample",
+       x = "Gene Expression",
+       y = "Density") +
+  theme(legend.position = "top")
